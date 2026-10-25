@@ -1,0 +1,18 @@
+services:
+  hongguo-web:
+    build:
+      context: .
+      args:
+        # 设为 "0" 构建不含无头浏览器的极简镜像（搜索功能不可用）
+        WITH_CHROMIUM: "1"
+    image: hongguo-web:latest
+    container_name: hongguo-web
+    ports:
+      - "8174:8174"
+    volumes:
+      # 剧集档案 / 播放进度 / 弹幕设备标识 / 在线缓存 持久化
+      - hongguo-data:/app/server/data
+    restart: unless-stopped
+
+volumes:
+  hongguo-data:
