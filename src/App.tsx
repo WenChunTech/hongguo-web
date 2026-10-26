@@ -22,24 +22,77 @@ const MENU = [
 ] as const;
 type PageId = (typeof MENU)[number]['id'];
 
+const PAGE_IDS = new Set<string>(MENU.map((item) => item.id));
+
+/** hash ↔ 路由：#/页ID；播放页 #/player/剧集ID[/集序号]。刷新与前进/后退均可恢复。 */
+function parseHash(hash: string): { page: PageId; navigation: PlayerNavigation | null } {
+  const parts = hash.replace(/^#\/?/, '').split('/').filter(Boolean);
+  const page = PAGE_IDS.has(parts[0] ?? '') ? (parts[0] as PageId) : 'browse';
+  const seriesId = parts[1] ?? '';
+  if (page === 'player' && /^\d{1,30}$/.test(seriesId)) {
+    const vidIndex = /^\d+$/.test(parts[2] ?? '') ? Number(parts[2]) : undefined;
+    return { page, navigation: { seriesId, vidIndex, resume: true } };
+  }
+  return { page, navigation: null };
+}
+
+function hashFor(page: PageId, navigation: PlayerNavigation | null): string {
+  if (page === 'player' && navigation) {
+    return `#/player/${navigation.seriesId}${navigation.vidIndex !== undefined ? `/${navigation.vidIndex}` : ''}`;
+  }
+  return `#/${page}`;
+}
+
 export default function App() {
-  const [page, setPage] = useState<PageId>('browse');
-  const [visited, setVisited] = useState<Set<PageId>>(() => new Set<PageId>(['browse']));
-  const [navigation, setNavigation] = useState<PlayerNavigation | null>(null);
+  const [initialRoute] = useState(() => parseHash(window.location.hash));
+  const [page, setPage] = useState<PageId>(initialRoute.page);
+  const [visited, setVisited] = useState<Set<PageId>>(() => new Set<PageId>([initialRoute.page]));
+  const [navigation, setNavigation] = useState<PlayerNavigation | null>(initialRoute.navigation);
   const visitedRef = useRef(visited);
   visitedRef.current = visited;
+  const pageRef = useRef(page);
+  pageRef.current = page;
 
   useEffect(() => { applyTheme(readTheme()); }, []);
 
-  const goto = useCallback((next: PageId) => {
+  const applyRoute = useCallback((next: PageId, nav: PlayerNavigation | null) => {
     setPage(next);
-    setVisited((prev) => new Set(prev).add(next));
+    setVisited((prev) => (prev.has(next) ? prev : new Set(prev).add(next)));
+    if (next === 'player') setNavigation(nav);
   }, []);
 
+  // hash 是页面状态的唯一来源：侧栏点击写入新历史条目，浏览器前进/后退、刷新
+  // 与深链都经 hashchange 恢复；页面 DOM 保持挂载（hidden 切换），播放不中断。
+  useEffect(() => {
+    const onHashChange = () => {
+      const { page: parsed, navigation: nav } = parseHash(window.location.hash);
+      applyRoute(parsed, nav);
+    };
+    window.addEventListener('hashchange', onHashChange);
+    // 初始加载：无效或缺失的 hash 归一化（replaceState 不产生历史条目）
+    if (!PAGE_IDS.has(window.location.hash.replace(/^#\/?/, '').split('/')[0] ?? '')) {
+      history.replaceState(null, '', hashFor(initialRoute.page, initialRoute.navigation));
+    }
+    return () => window.removeEventListener('hashchange', onHashChange);
+  }, [applyRoute, initialRoute]);
+
+  const navigate = useCallback((next: PageId, nav: PlayerNavigation | null) => {
+    const target = hashFor(next, nav);
+    if (window.location.hash === target) {
+      applyRoute(next, nav); // 地址未变化时不会触发 hashchange：直接应用，不重复压栈
+    } else {
+      window.location.hash = target;
+    }
+  }, [applyRoute]);
+
+  const goto = useCallback((next: PageId) => {
+    if (pageRef.current === next) return; // 重复点击当前页不产生历史条目
+    navigate(next, null);
+  }, [navigate]);
+
   const playSeries = useCallback((seriesId: string, vidIndex?: number) => {
-    setNavigation({ seriesId: String(seriesId), vidIndex, resume: true });
-    goto('player');
-  }, [goto]);
+    navigate('player', { seriesId: String(seriesId), vidIndex, resume: true });
+  }, [navigate]);
 
   const onNavigateHandled = useCallback(() => setNavigation(null), []);
 

@@ -213,9 +213,14 @@ export function Player({ active = true, navigation, onNavigateHandled, onOpenBro
   // ── 打开剧集 ─────────────────────────────────────────────────────
   const openSeries = useCallback(async (seriesId: string, vidIndex?: number, resume = false) => {
     try {
-      const data = await api.seriesEpisodes(seriesId);
-      if (!data.success || !data.data) throw new Error(data.error || '读取分集失败');
-      const next = data.data;
+      let data = await api.seriesEpisodes(seriesId);
+      let next = data.data;
+      if (!data.success || !next) {
+        // 未建档的剧集（联想「直接播放」、前进/后退或刷新恢复的播放地址）：先建档再读分集
+        const registered = await api.registerSeries(seriesId);
+        if (!registered.success || !registered.data) throw new Error(registered.error || data.error || '读取分集失败');
+        next = registered.data;
+      }
       detailRef.current = next; // startOnlinePlay 读取该 ref；setDetail 要到下次渲染才生效
       setDetail(next);
       setVideoSrc('');
