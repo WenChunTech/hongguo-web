@@ -16,6 +16,7 @@ const META_PATH = 'https://api5-normal-sinfonlineb.fqnovel.com/novel/player/vide
 const PLAN_PATH = '/reading/bookapi/plan/v';
 const REQUEST_TIMEOUT = 15000;
 const THROTTLE_MS = 260;
+const RETRY_PAUSE_MS = 500;
 const CACHE_TTL = 10 * 60 * 1000;
 
 let dataDir = '';
@@ -58,8 +59,8 @@ async function signedGet(apiUrl: string, query: Record<string, string>): Promise
       const res = await fetch(signed.url, { headers: signed.headers, signal: AbortSignal.timeout(REQUEST_TIMEOUT) });
       const buf = Buffer.from(await res.arrayBuffer());
       if (buf.length === 0) {
-        // 200 + 0 字节 = 风控/签名拒绝；重签（时间戳已过期）再试一次
-        if (attempt === 0) continue;
+        // 200 + 0 字节 = 风控/签名拒绝；稍候重签再试一次（立即重试只会撞进同一风控窗口）
+        if (attempt === 0) { await new Promise((resolve) => setTimeout(resolve, RETRY_PAUSE_MS)); continue; }
         throw Object.assign(new Error('接口返回空响应，已尝试签名重试'), { code: 'EMPTY_RESPONSE' });
       }
       const parsed = JSON.parse(buf.toString('utf8'));
@@ -82,7 +83,7 @@ async function signedPost(apiUrl: string, query: Record<string, string>, body: u
       });
       const buf = Buffer.from(await res.arrayBuffer());
       if (buf.length === 0) {
-        if (attempt === 0) continue;
+        if (attempt === 0) { await new Promise((resolve) => setTimeout(resolve, RETRY_PAUSE_MS)); continue; }
         throw Object.assign(new Error('接口返回空响应，已尝试签名重试'), { code: 'EMPTY_RESPONSE' });
       }
       const parsed = JSON.parse(buf.toString('utf8'));
@@ -160,6 +161,17 @@ export async function searchAppPage(keyword: string, offset = 0, searchId = ''):
   return parseSearchPage(payload);
 }
 
+/** 联想接口里带剧集的词条 → 搜索行。签名搜索 0 条/被风控时的兜底数据源。 */
+async function suggestSeriesRows(keyword: string): Promise<SearchRow[]> {
+  return (await searchSuggest(keyword))
+    .filter((row) => row.seriesId && row.seriesTitle)
+    .map((row) => ({
+      series_id: row.seriesId!, series_title: row.seriesTitle!, series_intro: '',
+      cover: row.cover ?? '', episode_cnt: 0,
+      ...(row.abstract.includes('热度') ? { heat: row.abstract } : {}),
+    }));
+}
+
 export async function searchSeries(keyword: string, offset = 0, searchId = '') {
   const clean = String(keyword || '').trim().slice(0, 60);
   if (!clean) return { success: false as const, error: '请输入搜索关键词' };
@@ -179,22 +191,24 @@ export async function searchSeries(keyword: string, offset = 0, searchId = '') {
       entry.pages.set(page.nextOffset, next);
       return { success: true as const, results: [...page.rows, ...next.rows], hasMore: next.hasMore, nextOffset: next.nextOffset, searchId: next.searchId, source: 'app' as const };
     }
-    // 综合搜索 0 条但联想命中了剧集：用联想的剧集条目兜底（如「霸总」这类缩略词）
-    if (offset === 0 && page.rows.length === 0 && !page.hasMore) {
+    // 综合搜索 0 条但联想命中了剧集：用联想的剧集条目兜底（如「霸总」这类缩略词，
+    // 或返回页全是小说/用户卡片被过滤成 0 条的情形）
+    if (offset === 0 && page.rows.length === 0) {
       try {
-        const rows: SearchRow[] = (await searchSuggest(clean))
-          .filter((row) => row.seriesId && row.seriesTitle)
-          .map((row) => ({
-            series_id: row.seriesId!, series_title: row.seriesTitle!, series_intro: '',
-            cover: row.cover ?? '', episode_cnt: 0,
-            ...(row.abstract.includes('热度') ? { heat: row.abstract } : {}),
-          }));
+        const rows = await suggestSeriesRows(clean);
         if (rows.length) return { success: true as const, results: rows, hasMore: false, nextOffset: 0, searchId: '', source: 'suggest' as const };
       } catch { /* 联想兜底失败保持 0 条 */ }
     }
     return { success: true as const, results: page.rows, hasMore: page.hasMore, nextOffset: page.nextOffset, searchId: page.searchId, source: 'app' as const };
   } catch (error: any) {
-    // 签名搜索失败 → 官网 SSR searchList 兜底（免费，无分页）
+    // 签名搜索失败（风控空响应/超时等）→ 联想接口的剧集条目兜底（联想与搜索是不同
+    // 上游端点，搜索被风控时联想往往仍可用）→ 官网 SSR searchList 兜底（已改版，多为空）。
+    try {
+      const rows = await suggestSeriesRows(clean);
+      if (rows.length) {
+        return { success: true as const, results: rows, hasMore: false, nextOffset: 0, searchId: '', source: 'suggest' as const };
+      }
+    } catch { /* 联想也失败，继续官网兜底 */ }
     const fallback = await searchSiteList(clean);
     if (fallback.length) {
       return { success: true as const, results: fallback, hasMore: false, nextOffset: 0, searchId: '', source: 'site' as const };
