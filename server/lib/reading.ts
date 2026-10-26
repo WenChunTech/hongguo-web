@@ -8,6 +8,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { signedApiRequest } from './app-source';
+import { normalizeCoverUrl } from './cover';
 
 const SEARCH_HOST = 'https://api5-normal-sinfonlinea.fqnovel.com';
 const SEARCH_PATH = '/reading/bookapi/search/tab/v';
@@ -124,12 +125,15 @@ function parseSearchPage(payload: any): { rows: SearchRow[]; hasMore: boolean; n
       for (const vd of flatVideoCells(cell)) {
         const sid = String(vd?.series_id ?? cell?.book_id ?? '');
         if (!/^\d{6,}$/.test(sid)) continue; // 无 series_id 的条目（小说/用户等）丢弃
+        // 0 剧集的条目（原作小说/漫画、未开播）在本播放器里不可播，直接过滤
+        const episodeCnt = Number(vd.episode_cnt) || 0;
+        if (episodeCnt <= 0) continue;
         rows.push({
           series_id: sid,
           series_title: String(vd.series_title || vd.title || cell.name || '').trim(),
           series_intro: String(vd.series_intro ?? '').trim(),
-          cover: String(vd.series_cover || vd.cover || '').replace(/\\u002F/g, '/').replace(/\\u0026/g, '&').replace(/&amp;/g, '&'),
-          episode_cnt: Number(vd.episode_cnt) || 0,
+          cover: normalizeCoverUrl(vd.series_cover || vd.cover),
+          episode_cnt: episodeCnt,
           ...(vd.score ? { score: String(vd.score) } : {}),
           ...(vd.play_cnt ? { play_cnt: Number(vd.play_cnt) } : {}),
           ...(typeof vd.rec_text === 'string' && vd.rec_text.includes('热度') ? { heat: vd.rec_text } : {}),
@@ -252,12 +256,14 @@ async function searchSiteList(keyword: string): Promise<SearchRow[]> {
       const vd = item?.video_data && typeof item.video_data === 'object' ? item.video_data : item;
       const sid = String(vd?.series_id ?? '');
       if (!/^\d{6,}$/.test(sid)) continue;
+      const episodeCnt = Number(vd?.episode_cnt) || 0;
+      if (episodeCnt <= 0) continue; // 与签名搜索一致：0 剧集条目不可播
       rows.push({
         series_id: sid,
         series_title: String(vd?.series_title || item?.name || '').trim(),
         series_intro: String(vd?.series_intro ?? '').trim(),
-        cover: String(vd?.series_cover ?? '').replace(/\\u002F/g, '/').replace(/\\u0026/g, '&'),
-        episode_cnt: Number(vd?.episode_cnt) || 0,
+        cover: normalizeCoverUrl(vd?.series_cover ?? ''),
+        episode_cnt: episodeCnt,
       });
     }
     return rows;
@@ -291,7 +297,7 @@ export async function searchSuggest(q: string): Promise<SuggestRow[]> {
       name: row.name.trim(),
       keyword: String(row.keyword ?? ''),
       abstract: String(row.sug_abstract ?? '').trim(),
-      ...(vd?.series_id ? { seriesId: String(vd.series_id), seriesTitle: String(vd.series_title ?? vd.title ?? row.name), cover: String(vd.cover ?? '') } : {}),
+      ...(vd?.series_id ? { seriesId: String(vd.series_id), seriesTitle: String(vd.series_title ?? vd.title ?? row.name), cover: normalizeCoverUrl(vd.cover ?? '') } : {}),
     });
     if (out.length >= 8) break;
   }
@@ -352,7 +358,7 @@ export async function relatedSeries(seriesId: string): Promise<{ related: Relate
       const title = String(item?.series_title ?? item?.title ?? '').trim();
       if (!title) continue;
       const season = Number(String(title).match(/第\s*([0-9一二三四五六七八九十]+)\s*[季部]/)?.[1]?.replace(/[一二三四五六七八九十]/g, (c) => String(['一','二','三','四','五','六','七','八','九','十'].indexOf(c) + 1)) ?? NaN);
-      const row: RelatedSeries = { series_id: sid, series_title: title, cover: String(item?.series_cover ?? item?.cover ?? ''), ...(Number.isFinite(season) ? { season } : {}) };
+      const row: RelatedSeries = { series_id: sid, series_title: title, cover: normalizeCoverUrl(item?.series_cover ?? item?.cover ?? ''), ...(Number.isFinite(season) ? { season } : {}) };
       (isRelated ? related : recommended).push(row);
     }
   }

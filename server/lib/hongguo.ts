@@ -6,6 +6,7 @@ import fs from 'node:fs';
 import { normalizeDownloadQuality } from './download-quality';
 import { isPublicMediaUrl, assertPublicHost, blockedAddress } from './web-media';
 import { readRouterData } from './catalog';
+import { normalizeCoverUrl } from './cover';
 
 export const API = 'https://api5-normal-sinfonlineb.fqnovel.com';
 export const UA = 'com.phoenix.read/71532 (Linux; U; Android 9; SM-N9860; Build/PQ3A.190705.10241111;tt-ok/3.12.13.20)';
@@ -407,7 +408,7 @@ export async function fetchEpisodeListFresh(seriesId: string) {
     title: item.title || '',
     series_id: String(item.series_id || sid),
     series_title: vd.series_title || '',
-    cover: vd.series_cover || vd.cover_url || item.cover_url || '',
+    cover: normalizeCoverUrl(vd.series_cover || vd.cover_url || item.cover_url || ''),
     // 分集时长（秒），来自上游 video_list[].duration，用于选集角标
     ...(Number(item.duration) > 0 ? { duration: Number(item.duration) } : {}),
   }));
@@ -416,7 +417,7 @@ export async function fetchEpisodeListFresh(seriesId: string) {
   return {
     series_id: String(sid),
     series_title: vd.series_title || '未命名短剧',
-    cover: vd.series_cover || vd.cover_url || (eps[0] && eps[0].cover) || '',
+    cover: normalizeCoverUrl(vd.series_cover || vd.cover_url || (eps[0] && eps[0].cover) || ''),
     total: eps.length,
     // 本剧简介：preload 接口下每集 title 常重复存放的是全剧简介，与 series_intro 比对剔除
     ...(typeof vd.series_intro === 'string' && vd.series_intro.trim() ? { series_intro: vd.series_intro.trim() } : {}),
