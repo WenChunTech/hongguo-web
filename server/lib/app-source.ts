@@ -10,12 +10,14 @@
 import crypto from 'node:crypto';
 import { sm3 } from './sm3';
 import { normalizeDownloadQuality, meetsDownloadQuality } from './download-quality';
+import { getPlaybackDevice } from './playback-device';
 
 const localId = () => String(1000000000000000n + BigInt('0x' + crypto.randomBytes(6).toString('hex')));
 const PROCESS_NONCE = crypto.randomBytes(18).toString('base64url');
 const PROCESS_STARTED = Date.now();
 const VIDEO_API = 'https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/v1/';
 const VIDEO_UA = 'com.phoenix.read/71332 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3; Cronet/TTNetVersion:04657795 2026-01-23 QuicVersion:c67e9834 2025-09-08)';
+const PLAYBACK_UA = 'com.phoenix.read/71532 (Linux; U; Android 9; SM-N9860; Build/PQ3A.190705.10241111;tt-ok/3.12.13.20)';
 const DEVICE: Record<string, string> = {
   ac: 'wifi', channel: 'update_64', aid: '8662', app_name: 'novelread',
   version_code: '71332', version_name: '7.1.3.32', device_platform: 'android', os: 'android',
@@ -425,9 +427,22 @@ export function signedApiRequest(apiUrl: string, query: Record<string, string> =
   return { url, headers, body: body.length ? body : null };
 }
 
-function signedVideoRequest(payload: string) {
-  return signedApiRequest(VIDEO_API, {}, payload);
+/**
+ * 播放直链请求：上游已要求注册设备身份，注册后的 device_id/iid/cdid 即可通过
+ * 校验（无需 x-gorgon/x-medusa 签名族）；随机合成 ID 一律 200+0 字节拒答。
+ */
+function playbackRequest(payload: string, identity: { device_id: string; iid: string; cdid: string }) {
+  const query = pythonUrlEncode({ ...DEVICE, ...identity, _rticket: String(Date.now()) });
+  return {
+    url: `${VIDEO_API}?${query}`,
+    body: Buffer.from(payload),
+    headers: {
+      'User-Agent': PLAYBACK_UA, Accept: 'application/json; charset=utf-8,application/x-protobuf',
+      'Content-Type': 'application/json; charset=UTF-8',
+    },
+  };
 }
+
 function parseFallback(value: unknown): string {
   if (typeof value === 'string') { const parsed = jsonBody(value); return parsed?.fallback_api || value; }
   if (Array.isArray(value)) return str(value[0]);
@@ -539,7 +554,7 @@ export async function fetchAppPlayUrl(vid: string, options: { quality?: string }
     biz_param: { detail_page_version: 0, device_level: 3, disable_digg_stat: false, need_all_video_definition: true, need_mp4_align: false, use_os_player: false, use_server_dns: false, video_platform: 1024 },
     mixed_video_id_map: { '1004': [vid] },
   });
-  const signed = signedVideoRequest(payload);
+  const signed = playbackRequest(payload, await getPlaybackDevice(requestJson));
   const response = await requestJson(signed.url, { method: 'POST', headers: signed.headers, body: signed.body }, deadline, signal);
   if (Number(response.Code || response.code || 0) !== 0) {
     throw Object.assign(new Error('App 接口暂未提供本集播放信息'), { code: 'BUSINESS_REJECTED' });
@@ -547,13 +562,17 @@ export async function fetchAppPlayUrl(vid: string, options: { quality?: string }
   const entry = response.data?.[vid];
   const model = typeof entry?.video_model === 'string' ? jsonBody(entry.video_model) : entry?.video_model;
   if (!model) throw Object.assign(new Error('App 接口未返回所选分集，已停止取址'), { code: entry?.video_model ? 'INVALID_RESPONSE' : 'MISSING_MODEL' });
-  const fallback = parseFallback(model.fallback_api);
-  if (!fallback) throw Object.assign(new Error('App 接口未返回本集片源地址'), { code: 'MISSING_MODEL' });
-  const outer = await requestJson(fallback, { headers: { 'User-Agent': VIDEO_UA } }, deadline, signal);
-  if ([outer, outer.video_info].some((value) => Number(value?.Code || value?.code || 0) !== 0)) {
-    throw Object.assign(new Error('App 接口暂未提供本集播放信息'), { code: 'BUSINESS_REJECTED' });
+  // video_list 可能内联在模型里（新响应形状），否则经 fallback_api 二段取片源
+  let info = model;
+  if (!(Array.isArray(model.video_list) && model.video_list.length)) {
+    const fallback = parseFallback(model.fallback_api);
+    if (!fallback) throw Object.assign(new Error('App 接口未返回本集片源地址'), { code: 'MISSING_MODEL' });
+    const outer = await requestJson(fallback, { headers: { 'User-Agent': VIDEO_UA } }, deadline, signal);
+    if ([outer, outer.video_info].some((value) => Number(value?.Code || value?.code || 0) !== 0)) {
+      throw Object.assign(new Error('App 接口暂未提供本集播放信息'), { code: 'BUSINESS_REJECTED' });
+    }
+    info = outer?.video_info?.data;
   }
-  const info = outer?.video_info?.data;
   if (!info) throw Object.assign(new Error('App 接口未返回本集片源模型'), { code: 'MISSING_MODEL' });
   const rows = Object.values<any>(info?.video_list || {})
     .filter((item) => item && (item.main_url || item.backup_url || Array.isArray(item.backup_url_list)))
