@@ -189,21 +189,29 @@ export async function searchSeries(keyword: string, offset = 0, searchId = '') {
   try {
     const page = await searchAppPage(clean, offset, searchId);
     entry.pages.set(offset, page);
+    let rows = page.rows;
+    let hasMore = page.hasMore;
+    let nextOffset = page.nextOffset;
+    let searchIdOut = page.searchId;
     // 首页结果过少且还有更多时自动续拉一页（精选条目少，避免用户误以为搜完了）
     if (offset === 0 && page.rows.length < 6 && page.hasMore) {
       const next = await searchAppPage(clean, page.nextOffset, page.searchId);
       entry.pages.set(page.nextOffset, next);
-      return { success: true as const, results: [...page.rows, ...next.rows], hasMore: next.hasMore, nextOffset: next.nextOffset, searchId: next.searchId, source: 'app' as const };
+      rows = [...page.rows, ...next.rows];
+      hasMore = next.hasMore;
+      nextOffset = next.nextOffset;
+      searchIdOut = next.searchId;
     }
-    // 综合搜索 0 条但联想命中了剧集：用联想的剧集条目兜底（如「霸总」这类缩略词，
-    // 或返回页全是小说/用户卡片被过滤成 0 条的情形）
-    if (offset === 0 && page.rows.length === 0) {
+    // 综合搜索混入大量无关推荐，且上游偶发漏掉联想里明确命中的季部条目；
+    // 用联想命中的剧集条目补全（去重后追加，app 结果保持在前），0 条时即联想兜底
+    if (offset === 0) {
       try {
-        const rows = await suggestSeriesRows(clean);
-        if (rows.length) return { success: true as const, results: rows, hasMore: false, nextOffset: 0, searchId: '', source: 'suggest' as const };
-      } catch { /* 联想兜底失败保持 0 条 */ }
+        const extra = (await suggestSeriesRows(clean))
+          .filter((row) => !rows.some((existing) => existing.series_id === row.series_id));
+        if (extra.length) rows = [...rows, ...extra];
+      } catch { /* 联想补全失败保持原结果 */ }
     }
-    return { success: true as const, results: page.rows, hasMore: page.hasMore, nextOffset: page.nextOffset, searchId: page.searchId, source: 'app' as const };
+    return { success: true as const, results: rows, hasMore, nextOffset, searchId: searchIdOut, source: page.rows.length ? ('app' as const) : ('suggest' as const) };
   } catch (error: any) {
     // 签名搜索失败（风控空响应/超时等）→ 联想接口的剧集条目兜底（联想与搜索是不同
     // 上游端点，搜索被风控时联想往往仍可用）→ 官网 SSR searchList 兜底（已改版，多为空）。
