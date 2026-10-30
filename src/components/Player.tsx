@@ -2,7 +2,7 @@
 // 断点续播、连播、预缓存下一集、清晰度切换保留进度、错误重连、自动隐藏控件、
 // 快捷键、画面模式按剧记忆。
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api, type PlaybackRecord, type SeriesDetail } from '../api';
+import { api, type EpisodeSummary, type PlaybackRecord, type SeriesDetail } from '../api';
 import { formatTime } from './PlayerControls';
 import { PlayerControls, type PlayQuality } from './PlayerControls';
 import { DanmakuLayer } from '../danmaku/DanmakuLayer';
@@ -15,6 +15,31 @@ import {
 const QUALITY_KEY = 'hongguo:online-quality';
 const AUTO_NEXT_KEY = 'hongguo:auto-next';
 const pictureModeKey = (sid: string) => `hongguo:picture-mode:${sid}`;
+/** 本集剩余多少秒时开始预取下一集。 */
+const PREFETCH_LEAD_SECONDS = 20;
+
+/** 本集之后最近的可播集（跳过锁定集）；没有则返回 undefined，表示本季已播完。 */
+function nextPlayableEpisode(episodes: EpisodeSummary[], from: number): EpisodeSummary | undefined {
+  return episodes
+    .filter((ep) => ep.vid_index > from && !ep.locked)
+    .sort((a, b) => a.vid_index - b.vid_index)[0];
+}
+
+/** 从剧名解析季数（第 2 季 / 第二季 / 第十二季）；无法解析时返回 null。 */
+function parseSeasonNumber(title: string): number | null {
+  const match = String(title).match(/第\s*([0-9零一二三四五六七八九十]+)\s*[季部]/);
+  if (!match) return null;
+  const raw = match[1];
+  if (/^\d+$/.test(raw)) return Number(raw);
+  const digits: Record<string, number> = { 零: 0, 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+  if (raw.includes('十')) {
+    const [tensText, onesText] = raw.split('十');
+    const tens = tensText ? digits[tensText] ?? 0 : 1;
+    const ones = onesText ? digits[onesText] ?? 0 : 0;
+    return tens * 10 + ones;
+  }
+  return digits[raw] ?? null;
+}
 
 export function readQuality(): PlayQuality {
   try {
@@ -41,6 +66,12 @@ interface PlayerProps {
 interface LibraryItem {
   series_id: string; series_title: string; cover: string; total: number;
   updatedAt: number; resume: PlaybackRecord | null;
+}
+
+/** 已就绪的下一集预取流：切集时直接复用，省去再次取源/解密。 */
+interface PrefetchedStream {
+  url: string; streamId: string; requestId: string;
+  quality: PlayQuality; seriesId: string; vidIndex: number;
 }
 
 export function Player({ active = true, navigation, onNavigateHandled, onOpenBrowse }: PlayerProps) {
@@ -90,7 +121,9 @@ export function Player({ active = true, navigation, onNavigateHandled, onOpenBro
   const detailRef = useRef<SeriesDetail | null>(null);
   detailRef.current = detail;
   const currentStreamRef = useRef<{ streamId?: string; requestId?: string }>({});
-  const prefetchRef = useRef(new Set<string>());
+  const prefetchRef = useRef(new Map<string, PrefetchedStream>());
+  const prefetchingRef = useRef(new Set<string>());
+  const prefetchSeasonRef = useRef('');
   const reconnectRef = useRef('');
   const pendingSeekRef = useRef<number | null>(null);
   const saveTimerRef = useRef(0);
@@ -105,6 +138,9 @@ export function Player({ active = true, navigation, onNavigateHandled, onOpenBro
   const brightnessRef = useRef(1);
   const tapTimerRef = useRef(0);
   const overlayTimerRef = useRef(0);
+  /** 鼠标单击画面切播放/暂停；双击仍是全屏，故单击动作延迟判定。 */
+  const clickTimerRef = useRef(0);
+  const mousePressedRef = useRef(false);
   const [gestureOverlay, setGestureOverlay] = useState<null | {
     kind: 'seek' | 'brightness' | 'volume' | 'speed' | 'tapseek';
     delta?: number; target?: number; value?: number; text?: string;
@@ -161,6 +197,12 @@ export function Player({ active = true, navigation, onNavigateHandled, onOpenBro
   currentIndexRef.current = currentIndex;
   const playingRef = useRef(false);
   playingRef.current = playing;
+  const activeRef = useRef(active);
+  activeRef.current = active;
+  const autoNextRef = useRef(autoNext);
+  autoNextRef.current = autoNext;
+  const qualityRef = useRef(quality);
+  qualityRef.current = quality;
 
   // ── 在线播放 ─────────────────────────────────────────────────────
   const releaseCurrent = useCallback(() => {
@@ -169,6 +211,45 @@ export function Player({ active = true, navigation, onNavigateHandled, onOpenBro
     currentStreamRef.current = {};
   }, []);
 
+  // ── 下一集预取（最后 20 秒触发；跨季时预取下一季第 1 集） ──────────
+  /** 释放未使用的预取会话；keepSeriesId 用于换季接力时保留即将播放的那一份。 */
+  const releasePrefetched = useCallback((keepSeriesId?: string) => {
+    for (const [vid, item] of [...prefetchRef.current]) {
+      if (keepSeriesId && item.seriesId === keepSeriesId) continue;
+      prefetchRef.current.delete(vid);
+      void api.playRelease({ streamId: item.streamId }).catch(() => {});
+    }
+  }, []);
+
+  const prefetchEpisode = useCallback((target: { vid: string; seriesId: string; vidIndex: number }) => {
+    if (!target.vid || prefetchRef.current.has(target.vid) || prefetchingRef.current.has(target.vid)) return;
+    prefetchingRef.current.add(target.vid);
+    const requestId = crypto.randomUUID();
+    void api.playPrepare({
+      vid: target.vid, seriesId: target.seriesId, vidIndex: target.vidIndex,
+      quality, requestId, prefetch: true,
+    }).then((result) => {
+      if (!result.success || !result.url || !result.streamId) return;
+      if (quality !== qualityRef.current) {
+        // 清晰度已切换：这份预取作废
+        void api.playRelease({ streamId: result.streamId }).catch(() => {});
+        return;
+      }
+      const current = detailRef.current;
+      if (current && current.series_id === target.seriesId && currentIndexRef.current === target.vidIndex) {
+        // 已经切到该集：当前播放走的是另一次取源，这份预取直接释放
+        void api.playRelease({ streamId: result.streamId }).catch(() => {});
+        return;
+      }
+      // 只保留一份待用预取：替换时释放旧会话，避免后台流堆积
+      releasePrefetched();
+      prefetchRef.current.set(target.vid, {
+        url: result.url, streamId: result.streamId, requestId,
+        quality, seriesId: target.seriesId, vidIndex: target.vidIndex,
+      });
+    }).catch(() => {}).finally(() => { prefetchingRef.current.delete(target.vid); });
+  }, [quality, releasePrefetched]);
+
   const startOnlinePlay = useCallback(async (index: number, seekTo?: number, force = false) => {
     const current = detailRef.current;
     if (!current) return;
@@ -176,6 +257,21 @@ export function Player({ active = true, navigation, onNavigateHandled, onOpenBro
     if (!episode) return;
     if (episode.locked) { showToast('该集为付费锁定集，网页端不提供播放'); return; }
     setError('');
+    // 命中预取：直接接上已就绪的流，切集无需再等取源/解密
+    const prefetched = force ? undefined : prefetchRef.current.get(episode.vid);
+    if (prefetched && prefetched.quality === quality) {
+      prefetchRef.current.delete(episode.vid);
+      releasePrefetched();
+      releaseCurrent();
+      currentStreamRef.current = { streamId: prefetched.streamId, requestId: prefetched.requestId };
+      pendingSeekRef.current = seekTo ?? null;
+      setPreparing(false);
+      setPreparePhase('');
+      setPreparePercent(0);
+      setVideoSrc(prefetched.url);
+      return;
+    }
+    releasePrefetched(); // 换了目标集：旧预取作废
     setPreparing(true);
     setPreparePhase('');
     setPreparePercent(0);
@@ -208,48 +304,92 @@ export function Player({ active = true, navigation, onNavigateHandled, onOpenBro
       window.clearInterval(poll);
       if (currentStreamRef.current.requestId === requestId) setPreparing(false);
     }
-  }, [quality, releaseCurrent, showToast]);
+  }, [quality, releaseCurrent, releasePrefetched, showToast]);
 
   // ── 打开剧集 ─────────────────────────────────────────────────────
+  const loadSeriesDetail = useCallback(async (seriesId: string, register = true) => {
+    const data = await api.seriesEpisodes(seriesId);
+    if (data.success && data.data) return data.data;
+    // 预取下一季时 register=false：不把还没看的剧提前塞进「我的剧库」
+    if (!register) throw new Error(data.error || '读取分集失败');
+    // 未建档的剧集（联想「直接播放」、前进/后退或刷新恢复的播放地址）：先建档再读分集
+    const registered = await api.registerSeries(seriesId);
+    if (registered.success && registered.data) return registered.data;
+    throw new Error(registered.error || data.error || '读取分集失败');
+  }, []);
+
+  /** 切换到一部剧的指定集（换季接力也走这里，避免重复拉分集）。 */
+  const applySeries = useCallback((next: SeriesDetail, index: number, resumeTime?: number) => {
+    detailRef.current = next; // startOnlinePlay 读取该 ref；setDetail 要到下次渲染才生效
+    setDetail(next);
+    setVideoSrc('');
+    setError('');
+    setCurrentTime(0);
+    setDuration(0);
+    reconnectRef.current = '';
+    releasePrefetched(next.series_id); // 保留本剧的预取（换季时正是下一季第 1 集）
+    resumeRef.current = resumeTime != null ? { time: resumeTime, label: formatTime(resumeTime) } : null;
+    // 画面模式按剧记忆
+    try { setPictureModeState(JSON.parse(window.localStorage.getItem(pictureModeKey(next.series_id)) || '"fit"')); } catch { setPictureModeState('fit'); }
+    setCurrentIndex(index);
+    void startOnlinePlayRef.current?.(index, resumeTime);
+  }, [releasePrefetched]);
+
   const openSeries = useCallback(async (seriesId: string, vidIndex?: number, resume = false) => {
     try {
-      let data = await api.seriesEpisodes(seriesId);
-      let next = data.data;
-      if (!data.success || !next) {
-        // 未建档的剧集（联想「直接播放」、前进/后退或刷新恢复的播放地址）：先建档再读分集
-        const registered = await api.registerSeries(seriesId);
-        if (!registered.success || !registered.data) throw new Error(registered.error || data.error || '读取分集失败');
-        next = registered.data;
-      }
-      detailRef.current = next; // startOnlinePlay 读取该 ref；setDetail 要到下次渲染才生效
-      setDetail(next);
-      setVideoSrc('');
-      setError('');
-      setCurrentTime(0);
-      setDuration(0);
-      reconnectRef.current = '';
-      prefetchRef.current = new Set();
-      resumeRef.current = null;
-      // 画面模式按剧记忆
-      try { setPictureModeState(JSON.parse(window.localStorage.getItem(pictureModeKey(seriesId)) || '"fit"')); } catch { setPictureModeState('fit'); }
-
+      const next = await loadSeriesDetail(seriesId);
       let index = 1;
+      let resumeTime: number | undefined;
       if (resume && next.resume && next.resume.vid_index > 0) {
         index = next.resume.vid_index;
-        resumeRef.current = { time: next.resume.currentTime, label: formatTime(next.resume.currentTime) };
+        resumeTime = next.resume.currentTime;
       } else if (vidIndex && vidIndex > 0) {
         index = vidIndex;
       }
-      setCurrentIndex(index);
-      void startOnlinePlayRef.current?.(index, resumeRef.current?.time || undefined);
+      applySeries(next, index, resumeTime);
     } catch (err: any) {
       setError(err?.message || '读取分集失败');
       setDetail(null);
     }
-  }, []);
+  }, [applySeries, loadSeriesDetail]);
 
   const startOnlinePlayRef = useRef(startOnlinePlay);
   startOnlinePlayRef.current = startOnlinePlay;
+
+  // ── 换季接力：从相关作品里挑「季数更大的最近一季」 ────────────────
+  const nextSeasonRef = useRef(new Map<string, { seriesId: string; title: string } | null>());
+
+  const resolveNextSeason = useCallback(async (current: SeriesDetail) => {
+    if (nextSeasonRef.current.has(current.series_id)) return nextSeasonRef.current.get(current.series_id) ?? null;
+    let resolved: { seriesId: string; title: string } | null = null;
+    try {
+      const data = await api.related(current.series_id);
+      const currentSeason = parseSeasonNumber(current.series_title);
+      const next = (data.related ?? [])
+        .filter((item) => item.series_id !== current.series_id && typeof item.season === 'number' && item.season > 0)
+        .filter((item) => currentSeason == null || (item.season as number) > currentSeason)
+        .sort((a, b) => (a.season as number) - (b.season as number))[0];
+      if (next) resolved = { seriesId: next.series_id, title: next.series_title };
+    } catch {
+      return null; // 拉取失败不缓存，下次播完还能再试
+    }
+    nextSeasonRef.current.set(current.series_id, resolved);
+    return resolved;
+  }, []);
+
+  /** 本季最后一集的最后 20 秒：提前把下一季第 1 集预取好。 */
+  const prefetchNextSeason = useCallback(async (current: SeriesDetail) => {
+    const key = `${current.series_id}:${currentIndexRef.current}`;
+    if (prefetchSeasonRef.current === key) return; // 每集只解析一次
+    prefetchSeasonRef.current = key;
+    const target = await resolveNextSeason(current);
+    if (!target) return;
+    try {
+      const nextDetail = await loadSeriesDetail(target.seriesId, false);
+      const first = nextDetail.episodes.find((ep) => !ep.locked);
+      if (first) prefetchEpisode({ vid: first.vid, seriesId: target.seriesId, vidIndex: first.vid_index });
+    } catch { /* 预取失败不影响当前播放 */ }
+  }, [loadSeriesDetail, prefetchEpisode, resolveNextSeason]);
 
   // 处理来自其它页面的播放导航（play-series 等价物）
   useEffect(() => {
@@ -272,8 +412,9 @@ export function Player({ active = true, navigation, onNavigateHandled, onOpenBro
       document.removeEventListener('visibilitychange', onVisibility);
       persistPosition({ force: true });
       releaseCurrent();
+      releasePrefetched();
     };
-  }, [detail?.series_id, persistPosition, releaseCurrent]);
+  }, [detail?.series_id, persistPosition, releaseCurrent, releasePrefetched]);
 
   // ── 切集 ─────────────────────────────────────────────────────────
   const findEpisode = useCallback((index: number) => detailRef.current?.episodes.find((ep) => ep.vid_index === index), []);
@@ -297,6 +438,7 @@ export function Player({ active = true, navigation, onNavigateHandled, onOpenBro
     setCurrentIndex(target);
     setCurrentTime(0);
     reconnectRef.current = '';
+    resumeRef.current = null; // 切集不再沿用开剧时的续播点
     void startOnlinePlay(target);
   }, [findEpisode, persistPosition, startOnlinePlay]);
 
@@ -309,9 +451,11 @@ export function Player({ active = true, navigation, onNavigateHandled, onOpenBro
       const target = Math.min(pendingSeekRef.current, Math.max(0, video.duration - 0.5));
       video.currentTime = target;
       pendingSeekRef.current = null;
+      resumeRef.current = null; // 续播点只生效一次
     }
     video.playbackRate = speed;
-    void video.play().catch(() => {});
+    // 播放页不在前台时不自动开播：离开后片源才就绪也不会在后台响起
+    if (activeRef.current) void video.play().catch(() => {});
   }, [speed]);
 
   const handleTimeUpdate = useCallback(() => {
@@ -320,16 +464,20 @@ export function Player({ active = true, navigation, onNavigateHandled, onOpenBro
     setCurrentTime(video.currentTime);
     if (video.buffered.length) setBuffered(video.buffered.end(video.buffered.length - 1));
     persistPosition();
-    // 预缓存下一集
+    // 最后 20 秒预取下一集；本季最后一集则提前解析并预取下一季第 1 集
     const current = detailRef.current;
-    if (current && video.currentTime > 5 && video.duration > 0) {
-      const next = current.episodes.find((ep) => ep.vid_index === currentIndexRef.current + 1);
-      if (next && !next.locked && !prefetchRef.current.has(next.vid)) {
-        prefetchRef.current.add(next.vid);
-        void api.playPrepare({ vid: next.vid, seriesId: current.series_id, vidIndex: next.vid_index, quality, requestId: crypto.randomUUID(), prefetch: true }).catch(() => {});
-      }
+    if (!current || !autoNextRef.current) return;
+    const total = video.duration;
+    if (!Number.isFinite(total) || total <= 0) return;
+    const remaining = total - video.currentTime;
+    if (remaining > PREFETCH_LEAD_SECONDS || remaining <= 0) return;
+    const next = nextPlayableEpisode(current.episodes, currentIndexRef.current);
+    if (next) {
+      prefetchEpisode({ vid: next.vid, seriesId: current.series_id, vidIndex: next.vid_index });
+      return;
     }
-  }, [persistPosition, quality]);
+    void prefetchNextSeason(current);
+  }, [persistPosition, prefetchEpisode, prefetchNextSeason]);
 
   const handleError = useCallback(() => {
     const current = detailRef.current;
@@ -349,33 +497,34 @@ export function Player({ active = true, navigation, onNavigateHandled, onOpenBro
   const handleEnded = useCallback(() => {
     persistPosition({ ended: true, force: true });
     const current = detailRef.current;
-    if (current && autoNext && currentIndexRef.current < current.episodes.length) {
+    if (!current || !autoNext) return;
+    // 本季还有可播的下一集：直接连播（goToEpisode 会继续跳过锁定集）
+    if (nextPlayableEpisode(current.episodes, currentIndexRef.current)) {
       goToEpisode(currentIndexRef.current + 1);
       return;
     }
-    // 本季播完：在相关作品里找下一季接力（按季数挑最小的更高季；服务端顺序不可信）
-    if (current && autoNext) {
-      void (async () => {
-        try {
-          const data = await api.related(current.series_id);
-          const nextSeason = (data.related ?? [])
-            .filter((item) => typeof item.season === 'number' && item.season > 0)
-            .sort((a, b) => a.season! - b.season!)[0];
-          if (!nextSeason) return;
-          showToast(`本季完结，自动接入《${nextSeason.series_title}》`);
-          await openSeries(nextSeason.series_id, 1, false);
-        } catch { /* 接力失败静默，保持剧终画面 */ }
-      })();
-    }
-  }, [autoNext, goToEpisode, persistPosition, openSeries, showToast]);
+    // 本季播完：接入相关作品里「季数更大的最近一季」第 1 集（服务端顺序不可信）
+    void (async () => {
+      const target = await resolveNextSeason(current);
+      if (!target) return;
+      try {
+        const nextDetail = await loadSeriesDetail(target.seriesId);
+        const first = nextDetail.episodes.find((ep) => !ep.locked);
+        if (!first) return;
+        showToast(`本季完结，自动接入《${target.title}》`);
+        applySeries(nextDetail, first.vid_index);
+      } catch { /* 接力失败静默，保持剧终画面 */ }
+    })();
+  }, [autoNext, applySeries, goToEpisode, loadSeriesDetail, persistPosition, resolveNextSeason, showToast]);
 
   const changeQuality = useCallback((next: PlayQuality) => {
     setQuality(next);
     window.localStorage.setItem(QUALITY_KEY, JSON.stringify(next));
     const video = videoRef.current;
+    releasePrefetched(); // 旧清晰度的预取作废
     // 切换清晰度保留进度（对齐桌面端 startOnlinePlay(seekTo, force)）
     void startOnlinePlay(currentIndexRef.current, video?.currentTime || undefined, true);
-  }, [startOnlinePlay]);
+  }, [releasePrefetched, startOnlinePlay]);
 
   const changeSpeed = useCallback((next: number) => {
     const bounded = Math.max(0.25, Math.min(4, next));
@@ -416,6 +565,14 @@ export function Player({ active = true, navigation, onNavigateHandled, onOpenBro
       if (playingRef.current && !menuOpenRef.current) setControlsVisible(false);
     }, 1000);
   }, []);
+  const togglePlayPause = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    if (video.paused) void video.play().catch(() => {});
+    else video.pause();
+    revealControls();
+  }, [revealControls]);
+
   const menuOpenRef = useRef(false);
   menuOpenRef.current = menuOpen;
   useEffect(() => { if (menuOpen) { setControlsVisible(true); window.clearTimeout(idleTimerRef.current); } }, [menuOpen]);
@@ -432,12 +589,13 @@ export function Player({ active = true, navigation, onNavigateHandled, onOpenBro
 
   const handlePointerLeave = useCallback((event: React.PointerEvent) => {
     if (event.pointerType === 'touch') return; // 触屏没有“移出”，交给空闲计时
+    mousePressedRef.current = false; // 移出后再松手不算点击
     if (playingRef.current && !menuOpenRef.current) setControlsVisible(false);
   }, []);
 
   // ── 触摸手势：点按切控件、双击 ±10s、横滑快进退、左半屏亮度/右半屏音量、长按 2x ──
   const handleStagePointerDown = useCallback((event: React.PointerEvent) => {
-    if (event.pointerType === 'mouse') return;
+    if (event.pointerType === 'mouse') { mousePressedRef.current = true; return; }
     const video = videoRef.current;
     const stage = stageRef.current;
     if (!video || !stage || !videoSrc) return;
@@ -506,6 +664,24 @@ export function Player({ active = true, navigation, onNavigateHandled, onOpenBro
   }, []);
 
   const handleStagePointerUp = useCallback((event: React.PointerEvent) => {
+    if (event.pointerType === 'mouse') {
+      const pressed = mousePressedRef.current;
+      mousePressedRef.current = false;
+      if (!pressed || event.button !== 0 || !videoRef.current) return;
+      const target = event.target as HTMLElement | null;
+      // 控件栏、弹层、按钮上的点击不切换播放
+      if (target?.closest('.player-controls, .player-popover, button, input')) return;
+      if (clickTimerRef.current) {
+        window.clearTimeout(clickTimerRef.current);
+        clickTimerRef.current = 0;
+        return; // 连击：交给 onDoubleClick 切全屏
+      }
+      clickTimerRef.current = window.setTimeout(() => {
+        clickTimerRef.current = 0;
+        togglePlayPause();
+      }, 250);
+      return;
+    }
     const g = gestureRef.current;
     if (!g || event.pointerId !== g.pointerId) return;
     if (event.pointerType === 'touch') event.preventDefault(); // 抑制合成的 dblclick 等
@@ -548,9 +724,10 @@ export function Player({ active = true, navigation, onNavigateHandled, onOpenBro
         }, 260);
       }
     }
-  }, [toggleFullscreen]);
+  }, [toggleFullscreen, togglePlayPause]);
 
   const handleStagePointerCancel = useCallback(() => {
+    mousePressedRef.current = false;
     const g = gestureRef.current;
     if (!g) return;
     const video = videoRef.current;
@@ -597,12 +774,13 @@ export function Player({ active = true, navigation, onNavigateHandled, onOpenBro
     return () => window.removeEventListener('keydown', handler, true);
   }, [active, shortcuts, goToEpisode, changeSpeed, toggleFullscreen, revealControls, showToast]);
 
-  // 离开播放页自动暂停（不自动恢复，回来手动点播放）；onPause 里会保存进度
+  // 离开播放页自动暂停（不自动恢复，回来手动点播放）；onPause 里会保存进度。
+  // 依赖 videoSrc：离开时若还在取源，片源就绪挂载后同样要被暂停住。
   useEffect(() => {
     if (active) return;
     const video = videoRef.current;
     if (video && !video.paused) video.pause();
-  }, [active]);
+  }, [active, videoSrc]);
 
   // ── 渲染 ─────────────────────────────────────────────────────────
   const episodes = detail?.episodes ?? [];
