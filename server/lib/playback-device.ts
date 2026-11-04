@@ -3,7 +3,7 @@
 // 随机合成 device_id 一律 200+0 字节拒答，稳定未注册 ID 返回 code=110001。
 // 注册流程（ttEncrypt KDF/载荷）移植自 jackotom/hongguo-drama
 // src/native/playback-device.js（GPL-3.0-only），其上游为
-// tsukiyo-zero/hongguoTV DeviceRegister.kt。身份仅存进程内，失败不重试以免刷设备。
+// tsukiyo-zero/hongguoTV DeviceRegister.kt。身份仅存进程内。
 import crypto from 'node:crypto';
 import { gzipSync } from 'node:zlib';
 
@@ -23,57 +23,110 @@ function responseId(response: any, name: string): string {
 }
 
 let registration: Promise<PlaybackIdentity> | null = null;
+let refreshAfter = 0;
+let retryAfter = 0;
+let registrationRetryAfter = 0;
+let lastRegistrationFailure: string | undefined;
 
-export function getPlaybackDevice(requestJson: RequestJson): Promise<PlaybackIdentity> {
-  // 失败的 Promise 同样缓存：预取与重试不得反复创建匿名设备
-  registration ||= Promise.resolve().then(async () => {
-    try {
-      const now = Date.now();
-      const cdid = crypto.randomUUID();
-      const header = {
-        display_name: '红果免费短剧', update_version_code: 73932, manifest_version_code: 73932,
-        app_version_minor: '7.3.9.32', aid: 8662, channel: 'update_64', package: 'com.phoenix.read',
-        app_version: '7.3.9.32', version_code: 73932, sdk_version: '3.7.0-rc.34-fanqie-xiaoshuo',
-        sdk_target_version: 29, git_hash: '3a88f4e', os: 'Android', os_version: '16', os_api: 36,
-        device_model: '25053RT47C', device_brand: 'Redmi', device_manufacturer: 'Redmi',
-        cpu_abi: 'arm64-v8a', release_build: 'b5e187f', density_dpi: 520, display_density: 'mdpi',
-        resolution: '1280x2772', language: 'zh', timezone: 8, access: 'wifi', not_request_sender: 0,
-        carrier: 'CHINA MOBILE', mcc_mnc: '46000', rom: 'eng.root.20231116.160340',
-        rom_version: 'W528JS release-keys', cdid,
-        sig_hash: '56a962410c494bbaf0b58dba20cae56f', openudid: crypto.randomBytes(8).toString('hex'),
-        clientudid: crypto.randomUUID(), ipv6_list: [] as string[], region: 'CN', tz_name: 'Asia/Shanghai',
-        tz_offset: 28800, sim_region: 'cn', sim_serial_number: [] as string[], oaid_may_support: false,
-        req_id: crypto.randomUUID(), device_platform: 'android',
-        custom: { account_region_src: 'fallback', account_region: 'cn', host_bit: 64, dragon_device_type: 'phone' }, pre_installed_channel: '',
-        apk_first_install_time: now, is_system_app: 0, sdk_flavor: 'china', guest_mode: 0,
-      };
-      const compressed = gzipSync(Buffer.from(JSON.stringify({ magic_tag: 'ss_app_log', header, _gen_time: now })));
-      const random = crypto.randomBytes(32);
-      const derived = crypto.createHash('sha512').update(Buffer.concat([
-        crypto.createHash('sha512').update(random).digest(), KDF_SALT,
-      ])).digest();
-      const cipher = crypto.createCipheriv('aes-128-cbc', derived.subarray(0, 16), derived.subarray(16, 32));
-      const plaintext = Buffer.concat([crypto.createHash('sha512').update(compressed).digest(), compressed]);
-      const data = Buffer.concat([Buffer.from('746305100000', 'hex'), random, cipher.update(plaintext), cipher.final()]);
-      const response = await requestJson(REGISTER_URL, {
-        method: 'POST',
-        headers: {
-          'User-Agent': REGISTER_UA,
-          Accept: 'application/json', 'Content-Type': 'application/octet-stream;tt-data=a',
-          'log-encode-type': 'gzip', 'x-ss-dp': '8662', 'x-ss-req-ticket': String(now),
-          'x-vc-bdturing-sdk-version': '4.0.3.cn', lc: '101', 'sdk-version': '2',
-          'passport-sdk-version': '5051452', 'x-neptune': '-8|50:51:59:30:40:47:49:39',
-          'x-ss-stub': crypto.createHash('md5').update(data).digest('hex').toUpperCase(),
-        },
-        body: data,
-      }, Date.now() + 8000, AbortSignal.timeout(8000));
-      const device_id = responseId(response, 'device_id');
-      const iid = responseId(response, 'install_id');
-      if (!device_id || !iid || Number(response?.code ?? response?.Code ?? 0) !== 0) throw new Error('Invalid registration');
-      return Object.freeze({ device_id, iid, cdid });
-    } catch (_) {
-      throw Object.assign(new Error('匿名播放设备注册失败，请重启应用后重试'), { code: 'DEVICE_REGISTRATION_FAILED' });
-    }
+/**
+ * 注册一个全新的匿名播放设备。播放身份可能是一次性的（上游按次校验），
+ * 每集取源都应调用本函数；搜索/账号类仍走 getPlaybackDevice 的共享身份。
+ * 注册失败有 10 秒冷却，避免风控下反复刷设备。
+ */
+export async function registerPlaybackDevice(requestJson: RequestJson): Promise<PlaybackIdentity> {
+  if (Date.now() < registrationRetryAfter) {
+    throw Object.assign(new Error('匿名播放设备注册失败，请检查网络，10 秒后重试'), {
+      code: 'DEVICE_REGISTRATION_FAILED', registrationFailure: lastRegistrationFailure,
+    });
+  }
+  try {
+    const now = Date.now();
+    const cdid = crypto.randomUUID();
+    const header = {
+      display_name: '红果免费短剧', update_version_code: 73932, manifest_version_code: 73932,
+      app_version_minor: '7.3.9.32', aid: 8662, channel: 'update_64', package: 'com.phoenix.read',
+      app_version: '7.3.9.32', version_code: 73932, sdk_version: '3.7.0-rc.34-fanqie-xiaoshuo',
+      sdk_target_version: 29, git_hash: '3a88f4e', os: 'Android', os_version: '16', os_api: 36,
+      device_model: '25053RT47C', device_brand: 'Redmi', device_manufacturer: 'Redmi',
+      cpu_abi: 'arm64-v8a', release_build: 'b5e187f', density_dpi: 520, display_density: 'mdpi',
+      resolution: '1280x2772', language: 'zh', timezone: 8, access: 'wifi', not_request_sender: 0,
+      carrier: 'CHINA MOBILE', mcc_mnc: '46000', rom: 'eng.root.20231116.160340',
+      rom_version: 'W528JS release-keys', cdid,
+      sig_hash: '56a962410c494bbaf0b58dba20cae56f', openudid: crypto.randomBytes(8).toString('hex'),
+      clientudid: crypto.randomUUID(), ipv6_list: [] as string[], region: 'CN', tz_name: 'Asia/Shanghai',
+      tz_offset: 28800, sim_region: 'cn', sim_serial_number: [] as string[], oaid_may_support: false,
+      req_id: crypto.randomUUID(), device_platform: 'android',
+      custom: { account_region_src: 'fallback', account_region: 'cn', host_bit: 64, dragon_device_type: 'phone' }, pre_installed_channel: '',
+      apk_first_install_time: now, is_system_app: 0, sdk_flavor: 'china', guest_mode: 0,
+    };
+    const compressed = gzipSync(Buffer.from(JSON.stringify({ magic_tag: 'ss_app_log', header, _gen_time: now })));
+    const random = crypto.randomBytes(32);
+    const derived = crypto.createHash('sha512').update(Buffer.concat([
+      crypto.createHash('sha512').update(random).digest(), KDF_SALT,
+    ])).digest();
+    const cipher = crypto.createCipheriv('aes-128-cbc', derived.subarray(0, 16), derived.subarray(16, 32));
+    const plaintext = Buffer.concat([crypto.createHash('sha512').update(compressed).digest(), compressed]);
+    const data = Buffer.concat([Buffer.from('746305100000', 'hex'), random, cipher.update(plaintext), cipher.final()]);
+    const response = await requestJson(REGISTER_URL, {
+      method: 'POST',
+      headers: {
+        'User-Agent': REGISTER_UA,
+        Accept: 'application/json', 'Content-Type': 'application/octet-stream;tt-data=a',
+        'log-encode-type': 'gzip', 'x-ss-dp': '8662', 'x-ss-req-ticket': String(now),
+        'x-vc-bdturing-sdk-version': '4.0.3.cn', lc: '101', 'sdk-version': '2',
+        'passport-sdk-version': '5051452', 'x-neptune': '-8|50:51:59:30:40:47:49:39',
+        'x-ss-stub': crypto.createHash('md5').update(data).digest('hex').toUpperCase(),
+      },
+      body: data,
+    }, Date.now() + 8000, AbortSignal.timeout(8000));
+    const device_id = responseId(response, 'device_id');
+    const iid = responseId(response, 'install_id');
+    if (Number(response?.code ?? response?.Code ?? 0) !== 0) throw Object.assign(new Error('Registration rejected'), { code: 'BUSINESS_REJECTED' });
+    if (!device_id || !iid) throw Object.assign(new Error('Invalid registration'), { code: 'INVALID_RESPONSE' });
+    registrationRetryAfter = 0;
+    return Object.freeze({ device_id, iid, cdid });
+  } catch (error: any) {
+    const status = Number(error?.status);
+    const registrationFailure = Number.isInteger(status) && status >= 300 && status <= 599 ? `HTTP_${status}`
+      : ['ECONNABORTED', 'ETIMEDOUT'].includes(error?.code) ? 'TIMEOUT'
+      : ['ENOTFOUND', 'EAI_AGAIN', 'ECONNRESET', 'ECONNREFUSED', 'EHOSTUNREACH', 'ENETUNREACH', 'EPIPE', 'ERR_NETWORK', 'ERR_CANCELED'].includes(error?.code) ? 'NETWORK_ERROR'
+      : ['EMPTY_RESPONSE', 'INVALID_RESPONSE', 'BUSINESS_REJECTED', 'SECURITY_BLOCKED'].includes(error?.code) ? error.code : 'UNKNOWN';
+    registrationRetryAfter = Date.now() + 10000;
+    lastRegistrationFailure = registrationFailure;
+    throw Object.assign(new Error('匿名播放设备注册失败，请检查网络，10 秒后重试'), {
+      code: 'DEVICE_REGISTRATION_FAILED', registrationFailure,
+    });
+  }
+}
+
+/**
+ * 共享注册身份：搜索/账号等需要稳定 device_id 的接口使用。
+ * 传 rejectedDevice 表示该身份刚被上游拒绝：换新身份重注册，但每分钟至多一次；
+ * 并发请求与迟到的失败都收敛到最新一次注册。
+ */
+export function getPlaybackDevice(requestJson: RequestJson, rejectedDevice?: PlaybackIdentity): Promise<PlaybackIdentity> {
+  if (retryAfter && Date.now() >= retryAfter) {
+    registration = null;
+    retryAfter = 0;
+  }
+  if (rejectedDevice && registration) {
+    const previous = registration;
+    return previous.then(async (current) => {
+      // Concurrent and late failures must share the newest device, with at most one renewal per minute.
+      if (registration !== previous || current !== rejectedDevice || Date.now() < refreshAfter) return registration!;
+      refreshAfter = Date.now() + 60000;
+      const renewal = Promise.resolve().then(() => registerPlaybackDevice(requestJson)).catch((error) => {
+        if (registration === renewal) registration = previous;
+        throw error;
+      });
+      registration = renewal;
+      return renewal;
+    });
+  }
+  // Share failures briefly to avoid concurrent retries, then allow recovery without restarting.
+  registration ||= Promise.resolve().then(() => registerPlaybackDevice(requestJson)).catch((error) => {
+    retryAfter = Date.now() + 10000;
+    throw error;
   });
   return registration;
 }

@@ -10,12 +10,15 @@
 import crypto from 'node:crypto';
 import { sm3 } from './sm3';
 import { normalizeDownloadQuality, meetsDownloadQuality } from './download-quality';
-import { getPlaybackDevice } from './playback-device';
+import { registerPlaybackDevice } from './playback-device';
 
 const localId = () => String(1000000000000000n + BigInt('0x' + crypto.randomBytes(6).toString('hex')));
 const PROCESS_NONCE = crypto.randomBytes(18).toString('base64url');
 const PROCESS_STARTED = Date.now();
 const VIDEO_API = 'https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/v1/';
+const VIDEO_HOST = new URL(VIDEO_API).hostname;
+// 主接口被空响应拒答时的备用线路（对齐参考实现 5.4+）
+const PLAYBACK_ALT_HOST = 'api5-normal-hl.fqnovel.com';
 const VIDEO_UA = 'com.phoenix.read/71332 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3; Cronet/TTNetVersion:04657795 2026-01-23 QuicVersion:c67e9834 2025-09-08)';
 const PLAYBACK_UA = 'com.phoenix.read/71532 (Linux; U; Android 9; SM-N9860; Build/PQ3A.190705.10241111;tt-ok/3.12.13.20)';
 const DEVICE: Record<string, string> = {
@@ -428,18 +431,35 @@ export function signedApiRequest(apiUrl: string, query: Record<string, string> =
 }
 
 /**
- * 播放直链请求：上游已要求注册设备身份，注册后的 device_id/iid/cdid 即可通过
- * 校验（无需 x-gorgon/x-medusa 签名族）；随机合成 ID 一律 200+0 字节拒答。
+ * 播放直链请求：注册设备身份 + 完整签名族（上游 5.4 起恢复签名校验，
+ * 仅凭注册身份或仅带随机 _rticket 的请求会得到 200+空响应）。
+ * 签名对 query 字节级敏感：抖动 _rticket 直到 hash 分支为 0（分支 1 的变体服务端不认）。
  */
-function playbackRequest(payload: string, identity: { device_id: string; iid: string; cdid: string }) {
-  const query = pythonUrlEncode({ ...DEVICE, ...identity, _rticket: String(Date.now()) });
+function playbackRequest(payload: string, identity: { device_id: string; iid: string; cdid: string }, host = VIDEO_HOST) {
+  const body = Buffer.from(payload);
+  const khronos = Math.floor(Date.now() / 1000);
+  const ticketBase = Date.now();
+  const device = { ...DEVICE, ...identity } as Record<string, string>;
+  let query = '', url = '', requestTicket = ticketBase;
+  for (let n = 0; n < 128; n += 1) {
+    requestTicket = ticketBase + n;
+    query = pythonUrlEncode({ ...device, ts: String(khronos), _rticket: String(requestTicket) });
+    url = `https://${host}/novel/player/multi_video_model/v1/?${query}`;
+    if (branchOf(url, body, khronos) === 0) break;
+    if (n === 127) throw new Error('无法生成播放请求签名');
+  }
   return {
-    url: `${VIDEO_API}?${query}`,
-    body: Buffer.from(payload),
+    url, body,
     headers: {
       'User-Agent': PLAYBACK_UA, Accept: 'application/json; charset=utf-8,application/x-protobuf',
       'Content-Type': 'application/json; charset=UTF-8',
-    },
+      'x-ss-req-ticket': String(requestTicket), 'sdk-version': '2', 'x-xs-from-web': '0',
+      'x-khronos': String(khronos),
+      'x-gorgon': xGorgon(query, body, khronos, Math.floor(Math.random() * 65536)),
+      'x-ladon': be32(khronos).toString('base64'), 'x-argus': le32(khronos).toString('base64'),
+      'x-helios': helios(khronos), 'x-medusa': buildMedusa(url, body, khronos, device), 'x-tt-dt': '',
+      'x-tt-store-region': 'cn', 'x-tt-store-region-src': 'did',
+    } as Record<string, string>,
   };
 }
 
@@ -532,6 +552,13 @@ async function requestJson(url: string, options: { method?: string; headers?: Re
     }
     if (response.status !== 200) throw Object.assign(new Error(`App 片源请求失败（HTTP ${response.status}）`), { status: response.status });
     const text = await response.text();
+    if (!text.trim()) {
+      // 200 + 空 body：典型的签名或设备鉴权被拒答，需按可重试错误处理
+      throw Object.assign(new Error('App 接口返回空响应，可能是签名或设备鉴权问题'), {
+        code: 'EMPTY_RESPONSE', status: response.status,
+        logid: response.headers.get('x-tt-logid') || '',
+      });
+    }
     const parsed = jsonBody(text);
     if (!parsed || typeof parsed !== 'object') throw Object.assign(new Error('App 接口未返回有效数据'), { code: 'INVALID_RESPONSE' });
     return parsed;
@@ -544,66 +571,138 @@ export interface AppVariant {
   userAgent: string; quality?: string; width?: number; height?: number;
 }
 
-export async function fetchAppPlayUrl(vid: string, options: { quality?: string } = {}): Promise<AppVariant & { variants: AppVariant[] }> {
-  const requestedQuality = normalizeDownloadQuality(options.quality);
+export async function fetchAppPlayUrl(vid: string, options: { quality?: string; allowLowerQuality?: boolean } = {}): Promise<AppVariant & { variants: AppVariant[] }> {
+  normalizeDownloadQuality(options.quality); // Validate before registration or network I/O.
   vid = String(vid || '');
   if (!/^\d{1,30}$/.test(vid)) throw new Error('分集编号无效');
-  const deadline = Date.now() + 12000;
-  const signal = AbortSignal.timeout(12000);
   const payload = JSON.stringify({
     biz_param: { detail_page_version: 0, device_level: 3, disable_digg_stat: false, need_all_video_definition: true, need_mp4_align: false, use_os_player: false, use_server_dns: false, video_platform: 1024 },
     mixed_video_id_map: { '1004': [vid] },
   });
-  const signed = playbackRequest(payload, await getPlaybackDevice(requestJson));
-  const response = await requestJson(signed.url, { method: 'POST', headers: signed.headers, body: signed.body }, deadline, signal);
+  // 播放身份可能是一次性的：每集取源重新注册；搜索/账号仍用共享身份。
+  let identity = await registerPlaybackDevice(requestJson);
+  // 注册自身有 8 秒预算，不得挤占取模型请求的 12 秒预算。
+  const deadline = Date.now() + 12000;
+  const signal = AbortSignal.timeout(12000);
+  let response: any;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const signed = playbackRequest(payload, identity, attempt ? PLAYBACK_ALT_HOST : VIDEO_HOST);
+    if (attempt) signed.headers.Connection = 'close';
+    try {
+      response = await requestJson(signed.url, { method: 'POST', headers: signed.headers, body: signed.body }, deadline, signal);
+      break;
+    } catch (error: any) {
+      if (attempt || error.code !== 'EMPTY_RESPONSE' || deadline - Date.now() < 1000) throw error;
+      // 冷却中的重注册必须仍允许用原身份做一次备用线路尝试。
+      if (deadline - Date.now() >= 8000) {
+        try { identity = await registerPlaybackDevice(requestJson); }
+        catch { /* 保留先前注册的身份走备用线路 */ }
+      }
+      if (deadline - Date.now() < 500) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+  }
   if (Number(response.Code || response.code || 0) !== 0) {
     throw Object.assign(new Error('App 接口暂未提供本集播放信息'), { code: 'BUSINESS_REJECTED' });
   }
   const entry = response.data?.[vid];
   const model = typeof entry?.video_model === 'string' ? jsonBody(entry.video_model) : entry?.video_model;
   if (!model) throw Object.assign(new Error('App 接口未返回所选分集，已停止取址'), { code: entry?.video_model ? 'INVALID_RESPONSE' : 'MISSING_MODEL' });
-  // video_list 可能内联在模型里（新响应形状），否则经 fallback_api 二段取片源
-  let info = model;
-  if (!(Array.isArray(model.video_list) && model.video_list.length)) {
+  // video_list 内联在模型里（新响应形状）时直接解析，否则经 fallback_api 二段取片源
+  const inline = Array.isArray(model.video_list) && model.video_list.length > 0;
+  const readFallback = async () => {
     const fallback = parseFallback(model.fallback_api);
     if (!fallback) throw Object.assign(new Error('App 接口未返回本集片源地址'), { code: 'MISSING_MODEL' });
     const outer = await requestJson(fallback, { headers: { 'User-Agent': VIDEO_UA } }, deadline, signal);
     if ([outer, outer.video_info].some((value) => Number(value?.Code || value?.code || 0) !== 0)) {
       throw Object.assign(new Error('App 接口暂未提供本集播放信息'), { code: 'BUSINESS_REJECTED' });
     }
-    info = outer?.video_info?.data;
+    return outer?.video_info?.data;
+  };
+  if (!inline) return parseAppPlayModel(await readFallback(), vid, options, false);
+  try {
+    return parseAppPlayModel(model, vid, options, true);
+  } catch (error: any) {
+    // 仅"缺少加密元数据"才启用该恢复路径；备用片源必须独立通过编号、时长、加密与地址校验。
+    const duration = Number(model.video_duration);
+    if (!error.incompleteEncryptionMetadata || typeof model.video_id !== 'string' || !model.video_id.trim()
+      || !Number.isFinite(duration) || duration <= 0 || !error.minimumPixels || !model.fallback_api) throw error;
+    const info = await readFallback();
+    const fallbackDuration = Number(info?.video_duration);
+    if (info?.video_id !== model.video_id || !Number.isFinite(fallbackDuration) || fallbackDuration <= 0
+      || Math.abs(fallbackDuration - duration) > 0.5) {
+      throw Object.assign(new Error('备用片源编号或完整时长无法确认，已停止取址'), { code: 'INVALID_RESPONSE' });
+    }
+    return parseAppPlayModel(info, vid, options, false, true, error.minimumPixels);
   }
+}
+
+/**
+ * 解析 App 片源模型为变体列表。inline=true 表示模型自带 video_list，要求加密元数据；
+ * 经 fallback_api 取回的模型视为不要求（上游可能缺 encrypt 标记）。
+ */
+function parseAppPlayModel(
+  info: any, vid: string,
+  options: { quality?: string; allowLowerQuality?: boolean },
+  inline: boolean,
+  requireEncryptionMetadata = inline,
+  minimumPixels = 0,
+): AppVariant & { variants: AppVariant[] } {
+  const requestedQuality = normalizeDownloadQuality(options.quality);
+  const allowLowerQuality = options.allowLowerQuality === true && requestedQuality !== 'auto';
   if (!info) throw Object.assign(new Error('App 接口未返回本集片源模型'), { code: 'MISSING_MODEL' });
-  const rows = Object.values<any>(info?.video_list || {})
+  const compatibleRows = Object.values<any>(info?.video_list || {})
     .filter((item) => item && (item.main_url || item.backup_url || Array.isArray(item.backup_url_list)))
     .map((item) => {
       const codec = str(item.codec_type || item.video_meta?.codec_type).toLowerCase();
-      // bytevc2 是字节私有编码（参数集在私有 bv2C box），Chromium 必黑屏，直接排除
-      const codecRank = codec === 'bytevc2' ? 2
-        : ['h264', 'avc', 'avc1'].includes(codec) ? 0
+      // bytevc2 是字节私有编码（参数集在私有 bv2C box），Chromium 必黑屏，直接排除；
+      // 桌面参考实现 5.7 靠内置 ffmpeg 转码支持它，Web 端不具备该条件。
+      const codecRank = ['h264', 'avc', 'avc1'].includes(codec) ? 0
         : ['hevc', 'h265', 'hvc1', 'hev1', 'bytevc1'].includes(codec) ? 1 : 2;
-      const quality = str(item.quality_desc || item.definition || item.height || item.vheight || item.video_meta?.definition);
+      const quality = str(item.quality_desc || item.definition || item.video_meta?.definition || item.height || item.vheight);
       const meta = item.video_meta || {};
       const [width, height] = ([[item.vwidth, item.vheight], [item.width, item.height], [meta.vwidth, meta.vheight], [meta.width, meta.height]]
         .map((pair) => pair.map(Number)).find((pair) => pair.every((value) => Number.isFinite(value) && value > 0)) || [0, 0]);
       const pixels = width && height ? Math.min(width, height) : Number(quality.match(/\d+/)?.[0] || 0);
       return { item, codec, codecRank, quality, pixels, width, height };
     })
-    .filter((row) => row.codecRank < 2 && meetsDownloadQuality(row, requestedQuality))
-    .sort((a, b) => requestedQuality === 'auto'
-      ? a.codecRank - b.codecRank || b.pixels - a.pixels
-      : Math.min(a.width, a.height) - Math.min(b.width, b.height) || a.codecRank - b.codecRank);
+    .filter((row) => row.codecRank < 2 && (!minimumPixels || Math.min(row.width, row.height) >= minimumPixels));
+  const rows = compatibleRows.filter((row) => allowLowerQuality || meetsDownloadQuality(row, requestedQuality)).sort((a, b) => {
+    if (requestedQuality === 'auto') return a.codecRank - b.codecRank || b.pixels - a.pixels;
+    const aMeets = meetsDownloadQuality(a, requestedQuality);
+    const bMeets = meetsDownloadQuality(b, requestedQuality);
+    if (aMeets !== bMeets) return Number(bMeets) - Number(aMeets);
+    const aPixels = Math.min(a.width, a.height);
+    const bPixels = Math.min(b.width, b.height);
+    return (aMeets ? aPixels - bPixels : bPixels - aPixels) || a.codecRank - b.codecRank;
+  });
   if (!rows.length) {
-    throw new Error(requestedQuality === 'auto'
-      ? '本集暂未提供兼容的 H.264/HEVC 片源'
-      : `本集暂无尺寸可确认且满足 ${requestedQuality} 的 H.264/HEVC 片源，未降级`);
+    const strictQuality = compatibleRows.length > 0 && requestedQuality !== 'auto' && !allowLowerQuality;
+    throw Object.assign(new Error(strictQuality
+      ? `本集暂无尺寸可确认且满足 ${requestedQuality} 的 H.264/HEVC 片源，未降级`
+      : Object.values<any>(info.video_list || {}).some((item) => str(item?.codec_type || item?.video_meta?.codec_type).toLowerCase() === 'bytevc2')
+        ? '本集仅提供播放器不支持的 ByteVC2 编码，当前无法播放，请在官方 App 观看'
+        : '本集暂未提供兼容的 H.264/HEVC 片源'), {
+      code: strictQuality ? 'QUALITY_UNAVAILABLE' : 'NO_COMPATIBLE_SOURCE',
+      ...(strictQuality ? { quality: requestedQuality } : {}),
+    });
   }
   let lastError: any;
+  let incompleteEncryptionMetadata = false;
   const variants: AppVariant[] = [];
   const seen = new Set<string>();
-  for (const selected of rows) {
+  // auto 表示"可用的最高档"：保留同分辨率档的全部兼容编码，但绝不静默降到更低档。
+  const bestPixels = rows[0].pixels;
+  const selectedRows = requestedQuality === 'auto'
+    ? (bestPixels > 0 ? rows.filter((row) => row.pixels === bestPixels) : rows.slice(0, 1))
+    : rows;
+  for (const selected of selectedRows) {
     try {
       const spade = selected.item.spade_a || selected.item.encrypt_info?.spade_a;
+      if (requireEncryptionMetadata && !spade && ![false, 0, '0', 'false'].includes(selected.item.encrypt_info?.encrypt)) {
+        if (selected.item.encrypt_info?.encrypt == null) incompleteEncryptionMetadata = true;
+        throw Object.assign(new Error('本集片源缺少有效解密信息'), { code: 'INVALID_RESPONSE' });
+      }
       const key = spade ? deriveContentKey(spade) : null;
       for (const candidate of [selected.item.main_url, selected.item.backup_url, ...(Array.isArray(selected.item.backup_url_list) ? selected.item.backup_url_list : [])]) {
         if (typeof candidate !== 'string' || !candidate) continue;
@@ -617,7 +716,8 @@ export async function fetchAppPlayUrl(vid: string, options: { quality?: string }
           if (seen.has(identity)) continue;
           seen.add(identity);
           variants.push({ url, contentKey, codec: selected.codec === 'bytevc1' ? 'hevc' : selected.codec, source: 'app', vid,
-            userAgent: VIDEO_UA, quality: requestedQuality === 'auto' ? selected.quality : requestedQuality,
+            userAgent: inline ? PLAYBACK_UA : VIDEO_UA,
+            quality: allowLowerQuality ? (selected.width && selected.height ? `${Math.min(selected.width, selected.height)}p` : '') : requestedQuality === 'auto' ? selected.quality : requestedQuality,
             ...(requestedQuality === 'auto' ? {} : { width: selected.width, height: selected.height }) });
         } catch (error) { lastError = error; }
       }
@@ -625,5 +725,11 @@ export async function fetchAppPlayUrl(vid: string, options: { quality?: string }
   }
   if (variants.length) return { ...variants[0], variants };
   throw lastError?.code === 'SECURITY_BLOCKED' ? lastError
-    : Object.assign(new Error('本集片源地址或密钥无法解析'), { code: 'INVALID_RESPONSE' });
+    : Object.assign(new Error('本集片源地址或密钥无法解析'), {
+      code: 'INVALID_RESPONSE',
+      ...(incompleteEncryptionMetadata ? {
+        incompleteEncryptionMetadata: true,
+        minimumPixels: Math.min(rows[0].width, rows[0].height),
+      } : {}),
+    });
 }
