@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// App 签名接口（X-Gorgon/X-Argus/X-Ladon/X-Helios/X-Medusa）取播放地址。
+// App 签名接口取播放地址。播放接口自 2026-11 起改用 551 Argus/Ladon 签名
+// （playback-signature.ts）并优先 video_tab 接口；搜索/目录/账号等其余接口族
+// 仍用 X-Gorgon/X-Argus/X-Ladon/X-Helios/X-Medusa（signedApiRequest）。
 // Signing and Spade algorithms adapted from woshishiq1/drpys
 // commit 22261adfa31435e3b3ef5a730b8a2a75bcaf1715, via N3urda/hongguoTV.
 // Ported from hongguo-drama src/native/app-source.js (GPL-3.0).
@@ -8,7 +10,9 @@
 // supported codec selection. Crypto tables and SDK protocol constants below
 // are not user credentials.
 import crypto from 'node:crypto';
+import { gzipSync } from 'node:zlib';
 import { sm3 } from './sm3';
+import { signPlayer } from './playback-signature';
 import { normalizeDownloadQuality, meetsDownloadQuality } from './download-quality';
 import { registerPlaybackDevice } from './playback-device';
 
@@ -17,10 +21,9 @@ const PROCESS_NONCE = crypto.randomBytes(18).toString('base64url');
 const PROCESS_STARTED = Date.now();
 const VIDEO_API = 'https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/v1/';
 const VIDEO_HOST = new URL(VIDEO_API).hostname;
-// 主接口被空响应拒答时的备用线路（对齐参考实现 5.4+）
-const PLAYBACK_ALT_HOST = 'api5-normal-hl.fqnovel.com';
+// 上游恢复播放签名后（参考实现 6.6/6.9），video_tab 接口为首选线路
+const VIDEO_TAB_API = 'https://api5-normal-sinfonlineb.fqnovel.com/reading/bookapi/video_tab/multi_video_model/v1/';
 const VIDEO_UA = 'com.phoenix.read/71332 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3; Cronet/TTNetVersion:04657795 2026-01-23 QuicVersion:c67e9834 2025-09-08)';
-const PLAYBACK_UA = 'com.phoenix.read/71532 (Linux; U; Android 9; SM-N9860; Build/PQ3A.190705.10241111;tt-ok/3.12.13.20)';
 const DEVICE: Record<string, string> = {
   ac: 'wifi', channel: 'update_64', aid: '8662', app_name: 'novelread',
   version_code: '71332', version_name: '7.1.3.32', device_platform: 'android', os: 'android',
@@ -29,6 +32,13 @@ const DEVICE: Record<string, string> = {
   update_version_code: '71332', host_abi: 'arm64-v8a', dragon_device_type: 'phone', pv_player: '71332',
   compliance_status: '0', need_personal_recommend: '1', player_so_load: '1', is_android_pad_screen: '0',
 };
+// 播放接口族各自版本的设备档案：video_tab 用 7.3.9.32，旧 POST 接口用 7.4.3.32
+const PLAYBACK_DEVICE: Record<string, string> = { ...DEVICE, version_code: '74332', version_name: '7.4.3.32',
+  manifest_version_code: '74332', update_version_code: '74332', pv_player: '74332' };
+const VIDEO_TAB_DEVICE: Record<string, string> = { ...DEVICE, version_code: '73932', version_name: '7.3.9.32',
+  manifest_version_code: '73932', update_version_code: '73932', pv_player: '73932' };
+// 播放侧媒体请求 UA 与播放接口设备档案版本一致（7.4.3.32）
+const PLAYBACK_UA = VIDEO_UA.replace(DEVICE.version_code, PLAYBACK_DEVICE.version_code);
 function str(value: unknown, fallback = '') { return String(value == null ? fallback : value).trim(); }
 function cleanUrl(value: string) { return str(value).replace(/\\\//g, '/').replace(/\\u0026/g, '&').replace(/&amp;/g, '&'); }
 function jsonBody(value: string): any { try { return JSON.parse(value); } catch { return null; } }
@@ -431,36 +441,39 @@ export function signedApiRequest(apiUrl: string, query: Record<string, string> =
 }
 
 /**
- * 播放直链请求：注册设备身份 + 完整签名族（上游 5.4 起恢复签名校验，
- * 仅凭注册身份或仅带随机 _rticket 的请求会得到 200+空响应）。
- * 签名对 query 字节级敏感：抖动 _rticket 直到 hash 分支为 0（分支 1 的变体服务端不认）。
+ * 播放直链请求：注册设备身份 + 播放专用 551 Argus/Ladon 签名。
+ * 传 videoId 时走 video_tab GET 接口（7.3.9.32 档案，无请求体）；
+ * 否则走旧 POST 接口（7.4.3.32 档案，gzip 请求体 + x-ss-stub）。
+ * 551 签名不依赖 hash 分支，无需抖动 _rticket。
  */
-function playbackRequest(payload: string, identity: { device_id: string; iid: string; cdid: string }, host = VIDEO_HOST) {
-  const body = Buffer.from(payload);
-  const khronos = Math.floor(Date.now() / 1000);
-  const ticketBase = Date.now();
-  const device = { ...DEVICE, ...identity } as Record<string, string>;
-  let query = '', url = '', requestTicket = ticketBase;
-  for (let n = 0; n < 128; n += 1) {
-    requestTicket = ticketBase + n;
-    query = pythonUrlEncode({ ...device, ts: String(khronos), _rticket: String(requestTicket) });
-    url = `https://${host}/novel/player/multi_video_model/v1/?${query}`;
-    if (branchOf(url, body, khronos) === 0) break;
-    if (n === 127) throw new Error('无法生成播放请求签名');
-  }
-  return {
-    url, body,
-    headers: {
-      'User-Agent': PLAYBACK_UA, Accept: 'application/json; charset=utf-8,application/x-protobuf',
-      'Content-Type': 'application/json; charset=UTF-8',
-      'x-ss-req-ticket': String(requestTicket), 'sdk-version': '2', 'x-xs-from-web': '0',
-      'x-khronos': String(khronos),
-      'x-gorgon': xGorgon(query, body, khronos, Math.floor(Math.random() * 65536)),
-      'x-ladon': be32(khronos).toString('base64'), 'x-argus': le32(khronos).toString('base64'),
-      'x-helios': helios(khronos), 'x-medusa': buildMedusa(url, body, khronos, device), 'x-tt-dt': '',
-      'x-tt-store-region': 'cn', 'x-tt-store-region-src': 'did',
-    } as Record<string, string>,
+function playbackRequest(payload: string, identity: { device_id: string; iid: string; cdid: string }, videoId = '') {
+  // 对最终 query 与实际 gzip 请求体签名；其他接口族保留原签名器。
+  const body = videoId ? null : gzipSync(Buffer.from(payload));
+  const requestTicket = Date.now();
+  const khronos = Math.floor(requestTicket / 1000);
+  const device = { ...(videoId ? VIDEO_TAB_DEVICE : PLAYBACK_DEVICE), ...identity } as Record<string, string>;
+  const values: Record<string, string> = videoId ? {
+    video_id: videoId, video_id_type: '0', device_level: '1',
+    need_all_video_definition: '1', need_mp4_align: '0', use_os_player: '0',
+    video_platform: '1024', source: '0', from_video_id: '',
+  } : {};
+  const query = pythonUrlEncode({ ...device, ...values, ts: String(khronos), _rticket: String(requestTicket) });
+  const url = `${videoId ? VIDEO_TAB_API : VIDEO_API}?${query}`;
+  const signature = signPlayer({ query, body, ts: khronos });
+  const headers: Record<string, string> = {
+    'User-Agent': VIDEO_UA.replace(DEVICE.version_code, device.version_code),
+    Accept: 'application/json; charset=utf-8,application/x-protobuf',
+    'x-ss-req-ticket': signature['x-ss-req-ticket'], 'sdk-version': '2', 'x-xs-from-web': '0',
+    'passport-sdk-version': videoId ? '50561' : '5051452', 'x-ss-dp': String(device.aid),
+    'x-khronos': signature['x-khronos'],
+    'x-ladon': signature['x-ladon'], 'x-argus': signature['x-argus'], 'x-tt-dt': '',
+    'x-tt-store-region': 'cn', 'x-tt-store-region-src': 'did',
   };
+  if (body) {
+    Object.assign(headers, { 'Content-Type': 'application/json; charset=UTF-8',
+      'Content-Encoding': 'gzip', 'x-ss-stub': signature['x-ss-stub'] });
+  } else headers['x-tt-request-tag'] = 't=0;n=0';
+  return { url, body, headers, method: videoId ? 'GET' : 'POST' };
 }
 
 function parseFallback(value: unknown): string {
@@ -543,8 +556,10 @@ async function requestJson(url: string, options: { method?: string; headers?: Re
         ? 'App 片源请求超时' : 'App 片源网络请求失败，请稍后重试'), { code });
     }
     if ([301, 302, 303, 307, 308].includes(response.status)) {
+      // 签名/会话头绑定最终 URL：带绑定头的请求不得跟随跳转。
+      const bound = Object.keys(options.headers ?? {}).some((name) => /^(?:x-argus|x-ladon|x-gorgon|x-medusa|cookie|authorization)$/i.test(name));
       // Do not resend a signed body to a redirect destination.
-      if (options.method === 'POST' || !response.headers.get('location')) {
+      if (options.method === 'POST' || bound || !response.headers.get('location')) {
         throw Object.assign(new Error('App 接口发生不支持的跳转'), { code: 'SECURITY_BLOCKED' });
       }
       url = checkedUrl(new URL(response.headers.get('location')!, url).href, ['fqnovel.com', 'snssdk.com']);
@@ -554,9 +569,8 @@ async function requestJson(url: string, options: { method?: string; headers?: Re
     const text = await response.text();
     if (!text.trim()) {
       // 200 + 空 body：典型的签名或设备鉴权被拒答，需按可重试错误处理
-      throw Object.assign(new Error('App 接口返回空响应，可能是签名或设备鉴权问题'), {
+      throw Object.assign(new Error('App 接口返回空响应（HTTP 200），原因尚未确认'), {
         code: 'EMPTY_RESPONSE', status: response.status,
-        logid: response.headers.get('x-tt-logid') || '',
       });
     }
     const parsed = jsonBody(text);
@@ -571,10 +585,36 @@ export interface AppVariant {
   userAgent: string; quality?: string; width?: number; height?: number;
 }
 
+// 播放、预取与下载共用一条按序放行的取源队列，相邻请求至少间隔 1 秒；
+// 明确的拒绝（403/429/业务拒绝）会同时阻断收到它之前已排队的取源。
+let playbackQueue: Promise<unknown> = Promise.resolve();
+let playbackReadyAt = 0;
+let playbackRejection: any = null;
+
 export async function fetchAppPlayUrl(vid: string, options: { quality?: string; allowLowerQuality?: boolean } = {}): Promise<AppVariant & { variants: AppVariant[] }> {
   normalizeDownloadQuality(options.quality); // Validate before registration or network I/O.
   vid = String(vid || '');
   if (!/^\d{1,30}$/.test(vid)) throw new Error('分集编号无效');
+  const previousRejection = playbackRejection;
+  const pending = playbackQueue.then(async () => {
+    if (playbackRejection !== previousRejection) throw playbackRejection;
+    const wait = playbackReadyAt - Date.now();
+    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+    try {
+      return await fetchAppPlayUrlFresh(vid, options);
+    } catch (error: any) {
+      if ([403, 429].includes(error?.status) || error.code === 'BUSINESS_REJECTED'
+        || (error.code === 'DEVICE_REGISTRATION_FAILED' && ['BUSINESS_REJECTED', 'HTTP_403', 'HTTP_429'].includes(error.registrationFailure))) playbackRejection = error;
+      throw error;
+    } finally {
+      playbackReadyAt = Date.now() + 1000;
+    }
+  });
+  playbackQueue = pending.catch(() => {});
+  return pending as Promise<AppVariant & { variants: AppVariant[] }>;
+}
+
+async function fetchAppPlayUrlFresh(vid: string, options: { quality?: string; allowLowerQuality?: boolean }): Promise<AppVariant & { variants: AppVariant[] }> {
   const payload = JSON.stringify({
     biz_param: { detail_page_version: 0, device_level: 3, disable_digg_stat: false, need_all_video_definition: true, need_mp4_align: false, use_os_player: false, use_server_dns: false, video_platform: 1024 },
     mixed_video_id_map: { '1004': [vid] },
@@ -586,30 +626,37 @@ export async function fetchAppPlayUrl(vid: string, options: { quality?: string; 
   const signal = AbortSignal.timeout(12000);
   let response: any;
   for (let attempt = 0; attempt < 2; attempt++) {
-    const signed = playbackRequest(payload, identity, attempt ? PLAYBACK_ALT_HOST : VIDEO_HOST);
+    // 优先当前 video_tab 接口；仅空响应才降级一次旧 POST 接口。
+    const signed = playbackRequest(payload, identity, attempt ? '' : vid);
     if (attempt) signed.headers.Connection = 'close';
     try {
-      response = await requestJson(signed.url, { method: 'POST', headers: signed.headers, body: signed.body }, deadline, signal);
+      response = await requestJson(signed.url, { method: signed.method, headers: signed.headers, body: signed.body }, deadline, signal);
       break;
     } catch (error: any) {
       if (attempt || error.code !== 'EMPTY_RESPONSE' || deadline - Date.now() < 1000) throw error;
-      // 冷却中的重注册必须仍允许用原身份做一次备用线路尝试。
+      // 冷却中的重注册必须仍允许用原身份做一次旧接口尝试。
       if (deadline - Date.now() >= 8000) {
         try { identity = await registerPlaybackDevice(requestJson); }
-        catch { /* 保留先前注册的身份走备用线路 */ }
+        catch (registrationError: any) {
+          if (registrationError?.code === 'DEVICE_REGISTRATION_FAILED'
+            && ['BUSINESS_REJECTED', 'HTTP_403', 'HTTP_429'].includes(registrationError.registrationFailure)) throw registrationError;
+          /* 其他注册失败保留先前注册的身份走旧接口 */
+        }
       }
-      if (deadline - Date.now() < 500) throw error;
-      await new Promise((resolve) => setTimeout(resolve, 300));
+      if (deadline - Date.now() < 1500) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 1000));
     }
   }
   if (Number(response.Code || response.code || 0) !== 0) {
     throw Object.assign(new Error('App 接口暂未提供本集播放信息'), { code: 'BUSINESS_REJECTED' });
   }
-  const entry = response.data?.[vid];
+  // video_tab 响应把模型放在 data.video_model_data 下，旧接口仍是 data 本身
+  const entries = response.data?.video_model_data ?? response.data;
+  const entry = entries?.[vid];
   const model = typeof entry?.video_model === 'string' ? jsonBody(entry.video_model) : entry?.video_model;
-  if (!model) throw Object.assign(new Error('App 接口未返回所选分集，已停止取址'), { code: entry?.video_model ? 'INVALID_RESPONSE' : 'MISSING_MODEL' });
-  // video_list 内联在模型里（新响应形状）时直接解析，否则经 fallback_api 二段取片源
-  const inline = Array.isArray(model.video_list) && model.video_list.length > 0;
+  if (!model || typeof model !== 'object' || Array.isArray(model)) throw Object.assign(new Error('App 接口未返回所选分集，已停止取址'), { code: entry?.video_model ? 'INVALID_RESPONSE' : 'MISSING_MODEL' });
+  // video_list 内联在模型里（对象或数组均可）时直接解析，否则经 fallback_api 二段取片源
+  const inline = model.video_list && typeof model.video_list === 'object' && Object.keys(model.video_list).length > 0;
   const readFallback = async () => {
     const fallback = parseFallback(model.fallback_api);
     if (!fallback) throw Object.assign(new Error('App 接口未返回本集片源地址'), { code: 'MISSING_MODEL' });
@@ -699,8 +746,9 @@ function parseAppPlayModel(
   for (const selected of selectedRows) {
     try {
       const spade = selected.item.spade_a || selected.item.encrypt_info?.spade_a;
-      if (requireEncryptionMetadata && !spade && ![false, 0, '0', 'false'].includes(selected.item.encrypt_info?.encrypt)) {
-        if (selected.item.encrypt_info?.encrypt == null) incompleteEncryptionMetadata = true;
+      const encrypt = selected.item.encrypt_info?.encrypt ?? selected.item.encrypt;
+      if (requireEncryptionMetadata && !spade && ![false, 0, '0', 'false'].includes(encrypt)) {
+        if (encrypt == null) incompleteEncryptionMetadata = true;
         throw Object.assign(new Error('本集片源缺少有效解密信息'), { code: 'INVALID_RESPONSE' });
       }
       const key = spade ? deriveContentKey(spade) : null;
